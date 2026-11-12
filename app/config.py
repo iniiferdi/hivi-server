@@ -1,0 +1,22 @@
+
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+HIVI_WS_TOKEN = os.getenv("HIVI_WS_TOKEN", "")
+
+# WebSocket
+WS_MAX_CONNECTIONS = 3
+WS_AUTH_TIMEOUT = 5
+WS_IDLE_TIMEOUT = 15
+WS_MAX_CHUNK_BYTES = 8192
+
+# Audio input
+AUDIO_SAMPLE_RATE = 16000
+AUDIO_CHANNELS = 1
+AUDIO_MAX_SIZE = 10 * 1024 * 1024
+AUDIO_MAX_DURATION = 120
+
+# Pemrosesan audio
+AUDIO_MAX_CONCURRENT_PROCESSING = 1
