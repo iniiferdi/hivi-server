@@ -68,9 +68,9 @@ RESULT_WAIT = 30.0            # tunggu perangkat tersambung untuk menerima hasil
 EVICT_WAIT = 3.0              # tunggu koneksi lama dibersihkan saat diusir (detik)
 
 # Total waktu maksimal untuk seluruh proses AI Brain, termasuk retry.
-BRAIN_TIMEOUT = 45
-BRAIN_ATTEMPT_TIMEOUT = 20
-BRAIN_MAX_ATTEMPTS = 3
+BRAIN_TIMEOUT = 90
+BRAIN_ATTEMPT_TIMEOUT = 45
+BRAIN_MAX_ATTEMPTS = 2
 BRAIN_RETRY_BASE_DELAY = 1.0
 
 TRANSIENT_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
@@ -88,7 +88,7 @@ AUDIO_OUTPUT_CHUNK_BYTES = 4096
 # Simpan audio per turn (sudah di-decode ke PCM) untuk debugging.
 DEBUG_SAVE_AUDIO = os.getenv("HIVI_DEBUG_AUDIO", "1") == "1"
 DEBUG_KEEP_FILES = 30
-DEBUG_DIR = Path(__file__).resolve().parent / "debug_audio"
+DEBUG_DIR = Path(__file__).resolve().parents[2] / "data" / "debug_audio"
 
 # Riwayat percakapan: "device" = berlanjut antar koneksi/reboot (disarankan),
 # "connection" = riwayat baru di setiap koneksi.
@@ -279,7 +279,9 @@ def save_debug_audio(samples, name):
 # ---------------------------------------------------------------- Brain
 
 def is_transient_error(error):
-    if getattr(error, "code", None) in TRANSIENT_STATUS_CODES:
+    code = getattr(error, "status_code", None) or getattr(error, "code", None)
+
+    if code in TRANSIENT_STATUS_CODES:
         return True
 
     if isinstance(error, (ConnectionError, TimeoutError)):

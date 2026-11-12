@@ -1,129 +1,89 @@
 import asyncio
 import os
+import re
 
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types
+from ollama import AsyncClient
 
 load_dotenv()
 
-API_KEY = os.getenv("GEMINI_API_KEY")
-MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
+MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:7b")
 
-REQUEST_TIMEOUT_MS = 30_000
+REQUEST_TIMEOUT = float(os.getenv("OLLAMA_TIMEOUT", "60"))   # detik
+KEEP_ALIVE = os.getenv("OLLAMA_KEEP_ALIVE", "30m")           # model tetap di memori
+NUM_CTX = int(os.getenv("OLLAMA_NUM_CTX", "4096"))
+MAX_NEW_TOKENS = int(os.getenv("OLLAMA_MAX_TOKENS", "300"))  # jawaban suara harus singkat
 MAX_HISTORY_ITEMS = 10
 
-if not API_KEY:
-    raise RuntimeError("GEMINI_API_KEY belum dikonfigurasi.")
+client = AsyncClient(host=OLLAMA_HOST, timeout=REQUEST_TIMEOUT)
 
-
-def _env_flag(name: str):
-    """True/False bila variabel diset, None bila tidak diset."""
-
-    raw = os.getenv(name)
-
-    if raw is None:
-        return None
-
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
-
-
-# Kunci berawalan "AQ." adalah API key Vertex AI Express Mode, BUKAN kunci
-# Gemini Developer API (AIza...). Keduanya memakai backend berbeda.
-# Paksa lewat GEMINI_USE_VERTEX=1 atau GEMINI_USE_VERTEX=0 bila perlu.
-_vertex_flag = _env_flag("GEMINI_USE_VERTEX")
-USE_VERTEX = _vertex_flag if _vertex_flag is not None else API_KEY.startswith("AQ.")
-
-_http_options = types.HttpOptions(timeout=REQUEST_TIMEOUT_MS)
-
-if USE_VERTEX:
-    client = genai.Client(
-        vertexai=True,
-        api_key=API_KEY,
-        http_options=_http_options,
-    )
-else:
-    client = genai.Client(
-        api_key=API_KEY,
-        http_options=_http_options,
-    )
-
-print(
-    f"[BRAIN] Client siap: model={MODEL} "
-    f"backend={'vertex-express' if USE_VERTEX else 'gemini-developer'}"
-)
+print(f"[BRAIN] Client siap: model={MODEL} backend=ollama host={OLLAMA_HOST}")
 
 HIVI_INSTRUCTIONS = """
-Kamu adalah Hivi, asisten virtual pribadi berbahasa Indonesia.
+Kamu adalah Hivi, teman belajar yang ramah dan sabar. Kamu bukan asisten
+atau pelayan, melainkan teman yang belajar bersama penggunanya.
 
-Karakteristik:
-- Berbicara secara natural, ramah, dan sopan.
-- Menggunakan bahasa Indonesia sebagai bahasa utama.
-- Memberikan jawaban yang jelas dan tidak bertele-tele.
-- Memahami konteks percakapan sebelumnya.
-- Tidak mengarang informasi ketika tidak mengetahui jawabannya.
-- Menggunakan gaya percakapan yang nyaman untuk interaksi suara.
+Karakter:
+- Berbicara santai, hangat, dan akrab, dengan bahasa Indonesia sehari-hari yang sopan.
+- Antusias dan menyemangati. Beri apresiasi saat pengguna berhasil atau mau mencoba.
+- Sabar. Kalau pengguna salah atau bingung, jangan menyalahkan; bantu pelan-pelan.
 
-Jawablah seperti asisten virtual yang sedang berbicara
-langsung dengan penggunanya.
-"""
+Cara membantu belajar:
+- Jelaskan konsep dengan bahasa sederhana, pakai contoh atau perumpamaan dari kehidupan sehari-hari.
+- Untuk soal atau masalah, bimbing langkah demi langkah dan beri petunjuk dulu,
+  jangan langsung memberi jawaban akhir kecuali pengguna memintanya.
+- Sesekali ajukan satu pertanyaan singkat untuk mengecek pemahaman,
+  tetapi jangan di setiap jawaban.
+- Kalau pengguna salah paham, luruskan dengan lembut.
+- Jika tidak tahu atau tidak yakin, katakan jujur dan jangan mengarang jawaban.
+- Ingat konteks percakapan sebelumnya dan hubungkan dengan hal yang sudah dipelajari.
 
-GENERATION_CONFIG = types.GenerateContentConfig(
-    system_instruction=HIVI_INSTRUCTIONS,
-    temperature=0.7,
-)
+Aturan format (jawabanmu akan dibacakan oleh text-to-speech):
+- Jawab singkat, maksimal 3 sampai 4 kalimat. Pecah penjelasan panjang menjadi beberapa giliran.
+- Jangan gunakan markdown, tanda bintang, tanda pagar, daftar bernomor, atau emoji.
+- Tulis angka, simbol, dan rumus dengan kata-kata yang mudah diucapkan
+  (misalnya "dua tambah tiga sama dengan lima").
 
-ROLE_MAP = {
-    "user": "user",
-    "assistant": "model",
-}
+Berbicaralah seperti teman yang sedang mengobrol langsung saat belajar bersama.
+""".strip()
+
+ALLOWED_ROLES = {"user", "assistant"}
 
 
-def build_contents(
+def build_messages(
     message: str,
     history: list[dict] | None,
-) -> list[types.Content]:
-    """Convert chat history and the new message into Gemini contents."""
+) -> list[dict]:
+    """Convert chat history and the new message into Ollama chat messages."""
 
-    contents: list[types.Content] = []
+    messages = [{"role": "system", "content": HIVI_INSTRUCTIONS}]
 
     for item in (history or [])[-MAX_HISTORY_ITEMS:]:
-        role = ROLE_MAP.get(item.get("role"))
+        role = item.get("role")
         text = item.get("content")
 
-        if role is None or not isinstance(text, str) or not text.strip():
+        if role not in ALLOWED_ROLES or not isinstance(text, str) or not text.strip():
             continue
 
-        contents.append(
-            types.Content(
-                role=role,
-                parts=[types.Part.from_text(text=text)],
-            )
-        )
+        messages.append({"role": role, "content": text})
 
-    contents.append(
-        types.Content(
-            role="user",
-            parts=[types.Part.from_text(text=message)],
-        )
-    )
+    messages.append({"role": "user", "content": message})
 
-    return contents
+    return messages
 
 
-def _empty_reason(response) -> str:
-    """Alasan respons kosong (diblokir, dipotong, dll.) untuk pesan error."""
+_MARKDOWN_CHARS = re.compile(r"[*_#`>~]+")
+_MULTI_SPACE = re.compile(r"[ \t]{2,}")
 
-    parts = []
 
-    feedback = getattr(response, "prompt_feedback", None)
-    if feedback is not None:
-        parts.append(f"prompt_feedback={feedback}")
+def clean_for_speech(text: str) -> str:
+    """Buang sisa markdown agar tidak terbaca aneh oleh TTS."""
 
-    for candidate in getattr(response, "candidates", None) or []:
-        parts.append(f"finish_reason={getattr(candidate, 'finish_reason', None)}")
+    text = _MARKDOWN_CHARS.sub("", text)
+    text = _MULTI_SPACE.sub(" ", text)
 
-    return "; ".join(parts) or "tanpa detail"
+    return text.strip()
 
 
 async def generate_response(
@@ -136,24 +96,30 @@ async def generate_response(
     lengkap dan memutuskan retry/fallback.
     """
 
-    response = await client.aio.models.generate_content(
+    response = await client.chat(
         model=MODEL,
-        contents=build_contents(message, history),
-        config=GENERATION_CONFIG,
+        messages=build_messages(message, history),
+        options={
+            "temperature": 0.7,
+            "num_ctx": NUM_CTX,
+            "num_predict": MAX_NEW_TOKENS,
+        },
+        keep_alive=KEEP_ALIVE,
     )
 
-    result = (response.text or "").strip()
+    result = clean_for_speech(response["message"]["content"] or "")
 
     if not result:
         raise RuntimeError(
-            f"Gemini menghasilkan respons kosong ({_empty_reason(response)})."
+            f"Ollama menghasilkan respons kosong "
+            f"(done_reason={response.get('done_reason')})."
         )
 
     return result
 
 
 async def check_brain(timeout: float = 20.0) -> str:
-    """Tes singkat saat startup agar kunci/model yang salah langsung ketahuan."""
+    """Tes singkat + pemanasan model (memuat model ke memori)."""
 
     return await asyncio.wait_for(
         generate_response("Jawab dengan satu kata saja: siap"),

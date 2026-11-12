@@ -1,3 +1,5 @@
+aiomqtt==2.5.1
+aiosqlite==0.22.1
 annotated-doc==0.0.5
 annotated-types==0.8.0
 anyio==4.16.0
@@ -19,7 +21,6 @@ filelock==4.2.9
 flatbuffers==25.12.19
 fsspec==2026.9.0
 google-auth==2.62.1
-google-genai==3.1.0
 h11==0.16.0
 hf-xet==1.8.0
 httpcore2==2.16.0
@@ -54,6 +55,7 @@ onnxruntime==1.31.1
 openai==3.49.0
 opentelemetry-api==1.45.2
 packaging==26.3
+paho-mqtt==2.2.0
 pathvalidate==3.3.1
 piper-tts==1.8.0
 pocket-tts==4.0.1
