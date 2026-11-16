@@ -1,9 +1,11 @@
 import asyncio
+import logging
 import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from app.config import WS_MAX_CONNECTIONS
 from app.routers import health, stt, tts, ws
 from app.services.conversation import (
     close_db,
@@ -11,8 +13,15 @@ from app.services.conversation import (
     init_db,
     save_exchange,
 )
-from app.services.stt import load_stt_model, transcribe_audio
+from app.services.stt import load_stt_model, transcribe_samples
 from app.services.tts import load_tts_model, tts_lock
+
+logging.basicConfig(
+    level=os.getenv("HIVI_LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+
+logger = logging.getLogger(__name__)
 
 # Brain (Ollama) dimatikan dulu. Nyalakan lagi dengan: HIVI_BRAIN_ENABLED=1
 BRAIN_ENABLED = os.getenv("HIVI_BRAIN_ENABLED", "0") == "1"
@@ -27,10 +36,15 @@ async def _brain_disabled_response(*args, **kwargs):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("Loading Hivi models...")
+    logger.info("Loading Hivi models...")
 
-    app.state.tts_model, app.state.voice_state = load_tts_model()
-    app.state.stt_model = load_stt_model()
+    # Model TTS dan STT dimuat paralel agar startup lebih singkat.
+    (app.state.tts_model, app.state.voice_state), app.state.stt_model = (
+        await asyncio.gather(
+            asyncio.to_thread(load_tts_model),
+            asyncio.to_thread(load_stt_model),
+        )
+    )
 
     await init_db()
 
@@ -40,32 +54,30 @@ async def lifespan(app: FastAPI):
 
         try:
             await check_brain(timeout=120)
-            print("[BRAIN] Model Ollama siap.")
+            logger.info("[BRAIN] Model Ollama siap.")
         except Exception as error:
-            print(f"[BRAIN] Warmup gagal (server tetap jalan): {error!r}")
+            logger.warning("[BRAIN] Warmup gagal (server tetap jalan): %r", error)
         brain_generate = generate_response
     else:
-        print("[BRAIN] Dimatikan (set HIVI_BRAIN_ENABLED=1 untuk menyalakan).")
+        logger.info("[BRAIN] Dimatikan (set HIVI_BRAIN_ENABLED=1 untuk menyalakan).")
         brain_generate = _brain_disabled_response
 
     try:
-        # Konfigurasi resource WebSocket
-        app.state.ws_connection_slots = asyncio.Semaphore(3)
-        app.state.audio_processing_slots = asyncio.Semaphore(1)
-        app.state.active_devices = set()
+        # Batas koneksi WebSocket
+        app.state.ws_connection_slots = asyncio.Semaphore(WS_MAX_CONNECTIONS)
 
         # Service yang dipakai handler WebSocket
-        app.state.stt_transcribe = transcribe_audio
+        app.state.stt_transcribe = transcribe_samples
         app.state.generate_response = brain_generate
         app.state.get_history = get_history
         app.state.save_exchange = save_exchange
         app.state.tts_lock = tts_lock
 
-        print("Hivi is ready!")
+        logger.info("Hivi is ready!")
         yield
     finally:
         await close_db()
-        print("Shutting down Hivi...")
+        logger.info("Shutting down Hivi...")
 
 
 app = FastAPI(

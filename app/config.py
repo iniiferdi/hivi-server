@@ -11,6 +11,15 @@ TTS_MODEL_CONFIG = (
     "hf://anak10thn/pocket-tts-indonesian/"
     "indonesian_6l.yaml@17257664e384561c957b02ac92edd1a24807f0e5"
 )
+TTS_WARMUP_TEXT = "Halo, aku Hivi."
+TTS_NUM_THREADS = int(os.getenv("HIVI_TTS_THREADS", "0"))  # 0 = otomatis
+TTS_CACHE_MAX_ENTRIES = 64
+
+# STT (Faster-Whisper)
+STT_MODEL_SIZE = os.getenv("HIVI_STT_MODEL", "tiny")
+STT_CPU_THREADS = int(os.getenv("HIVI_STT_THREADS", "4"))
+STT_LANGUAGE = "id"
+STT_BEAM_SIZE = 1
 
 HIVI_WS_TOKEN = os.getenv("HIVI_WS_TOKEN", "")
 

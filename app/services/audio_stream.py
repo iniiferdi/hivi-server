@@ -13,6 +13,9 @@ Server -> client
   upload_ok, processing, transcript, response, audio_start, <binary PCM>,
   audio_end, turn_complete, error, cancelled, pong
 
+audio_start berisi "streaming": true bila audio disintesis bertahap; "size" bernilai 0
+karena panjang total belum diketahui, dan akhir audio ditandai pesan audio_end.
+
 Pemrosesan (STT -> Brain -> TTS) berjalan di task terpisah per ucapan, sehingga
 handler tetap membaca pesan (cancel/ping) dan balasan dikirim ke koneksi AKTIF
 perangkat, bukan koneksi lama yang mungkin sudah mati.
@@ -20,31 +23,33 @@ perangkat, bukan koneksi lama yang mungkin sudah mati.
 
 import asyncio
 import json
+import logging
 import os
 import re
 import secrets
+import threading
 import time
-import traceback
+import wave
 import zlib
-from io import BytesIO
 from pathlib import Path
 from uuid import uuid4
 
 import numpy as np
-import scipy.io.wavfile
-
 from fastapi import WebSocket
 from fastapi.websockets import WebSocketDisconnect
 
 from app.config import (
+    AUDIO_MAX_DURATION,
+    AUDIO_MAX_SIZE,
+    AUDIO_SAMPLE_RATE,
     HIVI_WS_TOKEN,
     WS_AUTH_TIMEOUT,
     WS_IDLE_TIMEOUT,
     WS_MAX_CHUNK_BYTES,
-    AUDIO_SAMPLE_RATE,
-    AUDIO_MAX_SIZE,
-    AUDIO_MAX_DURATION,
 )
+from app.services.tts import generate_pcm16, stream_pcm16
+
+logger = logging.getLogger(__name__)
 
 
 PROTOCOL_VERSION = 2
@@ -63,7 +68,6 @@ UPLOAD_GAP_WARN = 1.0         # jeda antar frame yang dicatat (detik)
 TURN_TTL = 120.0              # ucapan yang tidak aktif dibuang setelah ini (detik)
 
 # Pemrosesan
-SLOT_WAIT = 20.0              # tunggu giliran pemrosesan (detik)
 RESULT_WAIT = 30.0            # tunggu perangkat tersambung untuk menerima hasil (detik)
 EVICT_WAIT = 3.0              # tunggu koneksi lama dibersihkan saat diusir (detik)
 
@@ -84,6 +88,10 @@ TRANSIENT_ERROR_NAMES = frozenset({
 })
 
 AUDIO_OUTPUT_CHUNK_BYTES = 4096
+
+# Sintesis TTS bertahap: audio dikirim begitu chunk pertama siap.
+# Matikan (HIVI_TTS_STREAMING=0) bila firmware membutuhkan "size" total di audio_start.
+TTS_STREAMING = os.getenv("HIVI_TTS_STREAMING", "1") == "1"
 
 # Simpan audio per turn (sudah di-decode ke PCM) untuk debugging.
 DEBUG_SAVE_AUDIO = os.getenv("HIVI_DEBUG_AUDIO", "1") == "1"
@@ -157,8 +165,28 @@ class Turn:
 _sessions: dict[str, DeviceSession] = {}
 _turns: dict[str, Turn] = {}
 
-# Cache audio fallback (teks -> (pcm16, sample_rate)).
-_fallback_cache: dict[str, tuple[bytes, int]] = {}
+# Referensi task background agar tidak di-garbage-collect sebelum selesai.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _log_background_failure(task):
+    if task.cancelled():
+        return
+
+    error = task.exception()
+    if error is not None:
+        logger.error("[WS] Task background '%s' gagal", task.get_name(), exc_info=error)
+
+
+def spawn(coroutine, name):
+    """Jalankan coroutine di background, di luar jalur kritis respons."""
+
+    task = asyncio.create_task(coroutine, name=name)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    task.add_done_callback(_log_background_failure)
+
+    return task
 
 
 def prune_turns():
@@ -232,39 +260,17 @@ def decode_audio(fmt, data) -> np.ndarray:
     raise ValueError(f"Format tidak didukung: {fmt}")
 
 
-def generate_pcm16(model, voice_state, text, lock):
-    """Generate mono PCM16 audio using Pocket TTS."""
-
-    with lock:
-        audio = model.generate_audio(voice_state, text)
-
-    audio_np = audio.detach().cpu().numpy()
-    audio_np = np.asarray(audio_np, dtype=np.float32).squeeze()
-
-    if audio_np.size == 0:
-        raise RuntimeError("TTS menghasilkan audio kosong.")
-
-    audio_np = np.nan_to_num(
-        audio_np,
-        nan=0.0,
-        posinf=1.0,
-        neginf=-1.0,
-    )
-
-    audio_np = np.clip(audio_np, -1.0, 1.0)
-
-    pcm16 = np.rint(audio_np * 32767.0).astype("<i2")
-
-    return pcm16.tobytes()
-
-
 def save_debug_audio(samples, name):
     """Tulis WAV debug dan pangkas file lama. Dijalankan di thread."""
 
     DEBUG_DIR.mkdir(parents=True, exist_ok=True)
     path = DEBUG_DIR / f"{name}.wav"
 
-    scipy.io.wavfile.write(str(path), AUDIO_SAMPLE_RATE, samples)
+    with wave.open(str(path), "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(AUDIO_SAMPLE_RATE)
+        wav.writeframes(samples.tobytes())
 
     files = sorted(DEBUG_DIR.glob("*.wav"), key=lambda p: p.stat().st_mtime)
     for old in files[:-DEBUG_KEEP_FILES]:
@@ -302,7 +308,7 @@ def describe_error(error):
 
 
 async def request_brain_response(app, message, history):
-    """Request a Gemini response with retry for transient failures."""
+    """Request a Brain response with retry for transient failures."""
 
     deadline = time.monotonic() + BRAIN_TIMEOUT
     last_error = None
@@ -324,16 +330,20 @@ async def request_brain_response(app, message, history):
 
         except asyncio.TimeoutError as error:
             last_error = error
-            print(f"[BRAIN] Attempt {attempt}/{BRAIN_MAX_ATTEMPTS} timed out.")
+            logger.warning(
+                "[BRAIN] Attempt %d/%d timed out.", attempt, BRAIN_MAX_ATTEMPTS
+            )
 
         except Exception as error:
             if not is_transient_error(error):
                 raise
 
             last_error = error
-            print(
-                f"[BRAIN] Attempt {attempt}/{BRAIN_MAX_ATTEMPTS} "
-                f"failed with transient error: {describe_error(error)}"
+            logger.warning(
+                "[BRAIN] Attempt %d/%d failed with transient error: %s",
+                attempt,
+                BRAIN_MAX_ATTEMPTS,
+                describe_error(error),
             )
 
         if attempt < BRAIN_MAX_ATTEMPTS:
@@ -350,6 +360,58 @@ async def request_brain_response(app, message, history):
     raise last_error
 
 
+# ---------------------------------------------------------------- TTS stream
+
+_STREAM_END = object()
+
+
+class TtsStream:
+    """Sintesis TTS di thread terpisah; chunk PCM16 disalurkan ke event loop."""
+
+    def __init__(self, app, text):
+        self.sample_rate = app.state.tts_model.sample_rate
+
+        self._loop = asyncio.get_running_loop()
+        self._queue = asyncio.Queue()
+        self._stop = threading.Event()
+        self._chunks = stream_pcm16(
+            app.state.tts_model,
+            app.state.voice_state,
+            text,
+            app.state.tts_lock,
+        )
+
+        self._loop.run_in_executor(None, self._produce)
+
+    def _emit(self, item):
+        try:
+            self._loop.call_soon_threadsafe(self._queue.put_nowait, item)
+        except RuntimeError:
+            # Event loop sudah ditutup: hentikan sintesis.
+            self._stop.set()
+
+    def _produce(self):
+        try:
+            for pcm in self._chunks:
+                if self._stop.is_set():
+                    break
+                self._emit(pcm)
+        except Exception as error:
+            self._emit(error)
+        finally:
+            # Menutup generator melepas tts_lock bila sintesis dihentikan lebih awal.
+            self._chunks.close()
+            self._emit(_STREAM_END)
+
+    async def get(self):
+        """Chunk berikutnya, instance Exception, atau _STREAM_END."""
+
+        return await self._queue.get()
+
+    def close(self):
+        self._stop.set()
+
+
 # ---------------------------------------------------------------- Balasan
 
 async def reply_error(turn, message, code):
@@ -358,7 +420,11 @@ async def reply_error(turn, message, code):
     session = await wait_session(turn.device_id, RESULT_WAIT)
 
     if session is None:
-        print(f"[WS] {turn.device_id}: perangkat tidak tersambung, error {code} dibuang")
+        logger.warning(
+            "[WS] %s: perangkat tidak tersambung, error %s dibuang",
+            turn.device_id,
+            code,
+        )
         return False
 
     try:
@@ -369,16 +435,14 @@ async def reply_error(turn, message, code):
         return False
 
 
-async def reply_audio(turn, audio_output, sample_rate):
-    """Stream audio balasan ke koneksi aktif. True bila terkirim penuh."""
+async def begin_audio(turn, sample_rate, size, streaming):
+    """Tunggu koneksi aktif lalu kirim audio_start. None bila gagal."""
 
     session = await wait_session(turn.device_id, RESULT_WAIT)
 
     if session is None:
-        print(f"[WS] {turn.device_id}: perangkat tidak tersambung, balasan dibuang")
-        return False
-
-    chunk_size = AUDIO_OUTPUT_CHUNK_BYTES
+        logger.warning("[WS] %s: perangkat tidak tersambung, balasan dibuang", turn.device_id)
+        return None
 
     try:
         await session.send_json({
@@ -387,15 +451,50 @@ async def reply_audio(turn, audio_output, sample_rate):
             "sample_rate": sample_rate,
             "channels": 1,
             "encoding": "pcm_s16le",
-            "size": len(audio_output),
-            "chunk_size": chunk_size,
+            "size": size,
+            "chunk_size": AUDIO_OUTPUT_CHUNK_BYTES,
+            "streaming": streaming,
         })
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        session.dead = True
+        logger.warning("[WS] %s: koneksi putus saat memulai balasan", turn.device_id)
+        return None
 
-        for offset in range(0, len(audio_output), chunk_size):
-            await session.send_bytes(audio_output[offset:offset + chunk_size])
+    return session
 
-        await session.send_json({"type": "audio_end"})
-        await session.send_json({"type": "turn_complete"})
+
+async def end_audio(session):
+    await session.send_json({"type": "audio_end"})
+    await session.send_json({"type": "turn_complete"})
+
+
+async def send_chunks(session, buffer, flush_all=False):
+    """Kirim isi buffer per chunk; sisa yang kurang dari satu chunk ditahan kecuali flush_all."""
+
+    size = AUDIO_OUTPUT_CHUNK_BYTES
+
+    while len(buffer) >= size or (flush_all and buffer):
+        await session.send_bytes(bytes(buffer[:size]))
+        del buffer[:size]
+
+
+async def reply_audio(turn, audio_output, sample_rate):
+    """Kirim audio balasan yang sudah utuh. True bila terkirim penuh."""
+
+    session = await begin_audio(turn, sample_rate, len(audio_output), streaming=False)
+
+    if session is None:
+        return False
+
+    try:
+        for offset in range(0, len(audio_output), AUDIO_OUTPUT_CHUNK_BYTES):
+            await session.send_bytes(
+                audio_output[offset:offset + AUDIO_OUTPUT_CHUNK_BYTES]
+            )
+
+        await end_audio(session)
         return True
 
     except asyncio.CancelledError:
@@ -403,25 +502,73 @@ async def reply_audio(turn, audio_output, sample_rate):
 
     except Exception:
         session.dead = True
-        print(f"[WS] {turn.device_id}: koneksi putus saat mengirim balasan")
+        logger.warning("[WS] %s: koneksi putus saat mengirim balasan", turn.device_id)
         return False
 
 
-async def get_fallback_audio(app):
-    cached = _fallback_cache.get(FALLBACK_TEXT)
+async def reply_synthesized(app, turn, text):
+    """Sintesis dan kirim audio bertahap. True bila terkirim penuh."""
 
-    if cached is None:
-        audio = await asyncio.to_thread(
-            generate_pcm16,
-            app.state.tts_model,
-            app.state.voice_state,
-            FALLBACK_TEXT,
-            app.state.tts_lock,
-        )
-        cached = (audio, app.state.tts_model.sample_rate)
-        _fallback_cache[FALLBACK_TEXT] = cached
+    stream = TtsStream(app, text)
+    pending = bytearray()
+    session = None
 
-    return cached
+    try:
+        while True:
+            item = await stream.get()
+
+            if item is _STREAM_END:
+                break
+
+            if isinstance(item, Exception):
+                logger.error("[TTS] Error saat sintesis", exc_info=item)
+
+                if session is None:
+                    await reply_error(turn, "Gagal membuat suara balasan.", "TTS_ERROR")
+                else:
+                    await session.send_json({
+                        "type": "error",
+                        "code": "TTS_ERROR",
+                        "message": "Gagal membuat suara balasan.",
+                    })
+                return False
+
+            pending.extend(item)
+
+            if len(pending) < AUDIO_OUTPUT_CHUNK_BYTES:
+                continue
+
+            if session is None:
+                session = await begin_audio(
+                    turn, stream.sample_rate, size=0, streaming=True
+                )
+                if session is None:
+                    return False
+
+            await send_chunks(session, pending)
+
+        if session is None:
+            session = await begin_audio(
+                turn, stream.sample_rate, size=0, streaming=True
+            )
+            if session is None:
+                return False
+
+        await send_chunks(session, pending, flush_all=True)
+        await end_audio(session)
+        return True
+
+    except asyncio.CancelledError:
+        raise
+
+    except Exception:
+        if session is not None:
+            session.dead = True
+        logger.warning("[WS] %s: koneksi putus saat mengirim balasan", turn.device_id)
+        return False
+
+    finally:
+        stream.close()
 
 
 async def speak_fallback(app, turn, reason):
@@ -431,12 +578,19 @@ async def speak_fallback(app, turn, reason):
         return False
 
     try:
-        audio, sample_rate = await get_fallback_audio(app)
+        # generate_pcm16 menyimpan hasil di cache, jadi pemanggilan berikutnya instan.
+        audio = await asyncio.to_thread(
+            generate_pcm16,
+            app.state.tts_model,
+            app.state.voice_state,
+            FALLBACK_TEXT,
+            app.state.tts_lock,
+        )
     except Exception:
-        print(f"[FALLBACK] Gagal membuat audio cadangan:\n{traceback.format_exc()}")
+        logger.exception("[FALLBACK] Gagal membuat audio cadangan")
         return False
 
-    print(f"[FALLBACK] Mengucapkan pesan cadangan ({reason})")
+    logger.info("[FALLBACK] Mengucapkan pesan cadangan (%s)", reason)
 
     await notify(turn.device_id, {
         "type": "response",
@@ -445,7 +599,7 @@ async def speak_fallback(app, turn, reason):
         "reason": reason,
     })
     await notify(turn.device_id, {"type": "processing", "stage": "tts"})
-    await reply_audio(turn, audio, sample_rate)
+    await reply_audio(turn, audio, app.state.tts_model.sample_rate)
 
     return True
 
@@ -453,14 +607,14 @@ async def speak_fallback(app, turn, reason):
 # ---------------------------------------------------------------- Pipeline
 
 async def process_turn(app, turn):
-    """STT -> Gemini -> TTS untuk satu ucapan yang sudah lengkap."""
+    """STT -> Brain -> TTS untuk satu ucapan yang sudah lengkap."""
 
     device_id = turn.device_id
 
     try:
         samples = decode_audio(turn.fmt, turn.data)
     except Exception:
-        print(f"[AUDIO] Gagal decode:\n{traceback.format_exc()}")
+        logger.exception("[AUDIO] Gagal decode")
         await reply_error(turn, "Audio tidak valid.", "INVALID_AUDIO")
         return
 
@@ -468,24 +622,20 @@ async def process_turn(app, turn):
         await reply_error(turn, "Audio yang diterima kosong.", "EMPTY_AUDIO")
         return
 
-    turn_name = f"{turn.utterance_id[:12]}"
+    turn_name = turn.utterance_id[:12]
     duration = samples.size / AUDIO_SAMPLE_RATE
     peak = int(np.abs(samples.astype(np.int32)).max())
 
-    print(
-        f"[AUDIO] {device_id}/{turn_name} | {turn.fmt} | Bytes: {len(turn.data)} | "
-        f"Samples: {samples.size} | Duration: {duration:.2f}s | Peak: {peak}"
+    logger.info(
+        "[AUDIO] %s/%s | %s | Bytes: %d | Samples: %d | Duration: %.2fs | Peak: %d",
+        device_id, turn_name, turn.fmt, len(turn.data), samples.size, duration, peak,
     )
 
     if DEBUG_SAVE_AUDIO:
-        try:
-            await asyncio.to_thread(save_debug_audio, samples, f"{device_id}-{turn_name}")
-        except Exception as error:
-            print(f"[AUDIO] Gagal menyimpan debug audio: {error!r}")
-
-    wav_buffer = BytesIO()
-    scipy.io.wavfile.write(wav_buffer, AUDIO_SAMPLE_RATE, samples)
-    wav_buffer.seek(0)
+        spawn(
+            asyncio.to_thread(save_debug_audio, samples, f"{device_id}-{turn_name}"),
+            "debug-audio",
+        )
 
     # ---------------- STT ----------------
     await notify(device_id, {"type": "processing", "stage": "stt"})
@@ -495,12 +645,12 @@ async def process_turn(app, turn):
         stt_result = await asyncio.to_thread(
             app.state.stt_transcribe,
             app.state.stt_model,
-            wav_buffer,
+            samples,
         )
         transcript = stt_result.get("text", "").strip()
 
     except Exception:
-        print(f"[STT] Error:\n{traceback.format_exc()}")
+        logger.exception("[STT] Error")
         await reply_error(turn, "Gagal mengenali suara.", "STT_ERROR")
         return
 
@@ -508,7 +658,7 @@ async def process_turn(app, turn):
         await reply_error(turn, "Tidak ada suara yang terdeteksi.", "NO_SPEECH")
         return
 
-    print(f"[STT] ({time.monotonic() - stt_started:.2f}s) Transcript: {transcript!r}")
+    logger.info("[STT] (%.2fs) Transcript: %r", time.monotonic() - stt_started, transcript)
     await notify(device_id, {"type": "transcript", "text": transcript})
 
     # ---------------- Brain ----------------
@@ -517,17 +667,17 @@ async def process_turn(app, turn):
     try:
         history = await app.state.get_history(turn.history_id)
     except Exception:
-        print(f"[BRAIN] get_history error (lanjut tanpa riwayat):\n{traceback.format_exc()}")
+        logger.exception("[BRAIN] get_history error (lanjut tanpa riwayat)")
         history = []
 
-    print("[BRAIN] Sending request to Gemini...")
+    logger.info("[BRAIN] Sending request...")
     brain_started = time.monotonic()
 
     try:
         answer = await request_brain_response(app, transcript, history)
 
     except asyncio.TimeoutError:
-        print("[BRAIN] Gemini request timed out.")
+        logger.warning("[BRAIN] Request timed out.")
 
         if await speak_fallback(app, turn, "BRAIN_TIMEOUT"):
             return
@@ -536,10 +686,7 @@ async def process_turn(app, turn):
         return
 
     except Exception as error:
-        print(
-            f"[BRAIN] Gemini error: {describe_error(error)}\n"
-            f"{traceback.format_exc()}"
-        )
+        logger.exception("[BRAIN] Error: %s", describe_error(error))
 
         if await speak_fallback(app, turn, "BRAIN_ERROR"):
             return
@@ -548,7 +695,7 @@ async def process_turn(app, turn):
         return
 
     if not isinstance(answer, str) or not answer.strip():
-        print(f"[BRAIN] Respons kosong/tidak valid: {answer!r}")
+        logger.warning("[BRAIN] Respons kosong/tidak valid: %r", answer)
 
         if await speak_fallback(app, turn, "BRAIN_EMPTY"):
             return
@@ -558,22 +705,28 @@ async def process_turn(app, turn):
 
     answer = answer.strip()
 
-    print(f"[BRAIN] Response received in {time.monotonic() - brain_started:.2f}s: {answer}")
+    logger.info("[BRAIN] Response received in %.2fs: %s", time.monotonic() - brain_started, answer)
 
-    try:
-        await app.state.save_exchange(
+    # Penyimpanan riwayat berjalan paralel dengan TTS, tidak menahan balasan.
+    spawn(
+        app.state.save_exchange(
             session_id=turn.history_id,
             user_message=transcript,
             assistant_message=answer,
-        )
-    except Exception:
-        print(f"[BRAIN] save_exchange error:\n{traceback.format_exc()}")
+        ),
+        "save-exchange",
+    )
 
     await notify(device_id, {"type": "response", "text": answer})
 
     # ---------------- TTS ----------------
     await notify(device_id, {"type": "processing", "stage": "tts"})
     tts_started = time.monotonic()
+
+    if TTS_STREAMING:
+        sent = await reply_synthesized(app, turn, answer)
+        logger.info("[TTS] stream selesai dalam %.2fs (terkirim=%s)", time.monotonic() - tts_started, sent)
+        return
 
     try:
         audio_output = await asyncio.to_thread(
@@ -583,48 +736,32 @@ async def process_turn(app, turn):
             answer,
             app.state.tts_lock,
         )
-        sample_rate = app.state.tts_model.sample_rate
 
     except Exception:
-        print(f"[TTS] Error:\n{traceback.format_exc()}")
+        logger.exception("[TTS] Error")
         await reply_error(turn, "Gagal membuat suara balasan.", "TTS_ERROR")
         return
 
-    print(f"[TTS] ({time.monotonic() - tts_started:.2f}s) {len(audio_output)} byte")
+    logger.info("[TTS] (%.2fs) %d byte", time.monotonic() - tts_started, len(audio_output))
 
-    await reply_audio(turn, audio_output, sample_rate)
+    await reply_audio(turn, audio_output, app.state.tts_model.sample_rate)
 
 
 async def run_turn(app, turn):
     """Task pemrosesan satu ucapan; terlepas dari koneksi yang mengunggahnya."""
 
-    acquired = False
-
     try:
-        try:
-            await asyncio.wait_for(
-                app.state.audio_processing_slots.acquire(),
-                timeout=SLOT_WAIT,
-            )
-            acquired = True
-        except asyncio.TimeoutError:
-            await reply_error(turn, "Server sedang memproses audio lain.", "SERVER_BUSY")
-            return
-
         await process_turn(app, turn)
 
     except asyncio.CancelledError:
-        print(f"[WS] {turn.device_id}: pemrosesan dibatalkan")
+        logger.info("[WS] %s: pemrosesan dibatalkan", turn.device_id)
         raise
 
     except Exception:
-        print(f"[WS] {turn.device_id}: error pemrosesan:\n{traceback.format_exc()}")
+        logger.exception("[WS] %s: error pemrosesan", turn.device_id)
         await reply_error(turn, "Terjadi kesalahan pada server.", "INTERNAL_ERROR")
 
     finally:
-        if acquired:
-            app.state.audio_processing_slots.release()
-
         turn.state = "done"
         turn.updated = time.monotonic()
         turn.data = bytearray()          # bebaskan memori
@@ -649,31 +786,30 @@ async def send_error(session, message, code):
         pass
 
 
-async def receive_message(websocket, session):
+async def receive_message(websocket, evict_waiter):
     """Terima pesan berikutnya; berhenti bila idle terlalu lama atau diusir."""
 
+    if evict_waiter.done():
+        raise Evicted
+
     recv = asyncio.ensure_future(websocket.receive())
-    evict = asyncio.ensure_future(session.evict.wait())
 
     try:
         done, _ = await asyncio.wait(
-            {recv, evict},
+            {recv, evict_waiter},
             timeout=WS_IDLE_TIMEOUT,
             return_when=asyncio.FIRST_COMPLETED,
         )
     except BaseException:
         recv.cancel()
-        evict.cancel()
         raise
 
     if recv in done:
-        evict.cancel()
         return recv.result()
 
     recv.cancel()
-    evict.cancel()
 
-    if evict in done:
+    if evict_waiter in done:
         raise Evicted
 
     raise asyncio.TimeoutError
@@ -681,10 +817,6 @@ async def receive_message(websocket, session):
 
 async def authenticate(websocket):
     """Authenticate the connecting device."""
-
-    if not HIVI_WS_TOKEN:
-        await websocket.close(code=1011)
-        return False
 
     try:
         message = await asyncio.wait_for(
@@ -697,7 +829,7 @@ async def authenticate(websocket):
     except (ValueError, WebSocketDisconnect):
         return False
 
-    if message.get("type") != "auth":
+    if not isinstance(message, dict) or message.get("type") != "auth":
         await websocket.close(code=1008)
         return False
 
@@ -717,7 +849,7 @@ async def authenticate(websocket):
 async def fail_turn(session, turn, code, message):
     """Gagalkan ucapan yang sedang diunggah (koneksi tetap hidup)."""
 
-    print(f"[WS] {turn.device_id}: ucapan gagal ({code})")
+    logger.warning("[WS] %s: ucapan gagal (%s)", turn.device_id, code)
 
     turn.state = "failed"
     turn.updated = time.monotonic()
@@ -747,7 +879,7 @@ async def handle_audio_start(session, device_id, data):
     # Ucapan baru menggantikan yang lama; pemrosesan lama dibatalkan.
     old = _turns.get(device_id)
     if old is not None and old.task is not None and not old.task.done():
-        print(f"[WS] {device_id}: ucapan baru membatalkan pemrosesan sebelumnya")
+        logger.info("[WS] %s: ucapan baru membatalkan pemrosesan sebelumnya", device_id)
         old.task.cancel()
 
     history_id = device_id if HISTORY_SCOPE == "device" else session.session_id
@@ -777,7 +909,7 @@ async def handle_resume(session, device_id, data):
         elif turn.state == "processing":
             state = "processing"
 
-    print(f"[WS] {device_id}: resume {uid} -> {state} (next_seq={next_seq})")
+    logger.info("[WS] %s: resume %s -> %s (next_seq=%d)", device_id, uid, state, next_seq)
 
     await session.send_json({
         "type": "resume_ok",
@@ -812,7 +944,10 @@ async def handle_frame(session, device_id, chunk):
     if seq > turn.next_seq:                       # ada frame hilang: minta dikirim ulang
         if now - turn.last_nack_at >= NACK_MIN_INTERVAL:
             turn.last_nack_at = now
-            print(f"[WS] {device_id}: gap frame (dapat {seq}, butuh {turn.next_seq}), nack")
+            logger.warning(
+                "[WS] %s: gap frame (dapat %d, butuh %d), nack",
+                device_id, seq, turn.next_seq,
+            )
             await session.send_json({
                 "type": "nack",
                 "utterance_id": turn.utterance_id,
@@ -834,7 +969,10 @@ async def handle_frame(session, device_id, chunk):
     if gap > turn.max_gap:
         turn.max_gap = gap
     if gap > UPLOAD_GAP_WARN:
-        print(f"[WS] {device_id}: jeda antar frame {gap:.2f}s (frame #{turn.next_seq}) - cek WiFi")
+        logger.warning(
+            "[WS] %s: jeda antar frame %.2fs (frame #%d) - cek WiFi",
+            device_id, gap, turn.next_seq,
+        )
 
     duration = len(turn.data) / (AUDIO_SAMPLE_RATE * turn.bps)
     if duration > AUDIO_MAX_DURATION:
@@ -892,8 +1030,9 @@ async def handle_audio_end(app, session, device_id, data):
 
     # Frame belum lengkap: minta kirim ulang dari yang hilang
     if len(turn.data) < declared_bytes or turn.next_seq < declared_frames:
-        print(
-            f"[WS] {device_id}: audio_end tapi baru {len(turn.data)}/{declared_bytes} byte, nack"
+        logger.warning(
+            "[WS] %s: audio_end tapi baru %d/%d byte, nack",
+            device_id, len(turn.data), declared_bytes,
         )
         await session.send_json({
             "type": "nack",
@@ -920,10 +1059,14 @@ async def handle_audio_end(app, session, device_id, data):
 
     elapsed = time.monotonic() - turn.created
 
-    print(
-        f"[WS] {device_id}: upload selesai {len(turn.data)} byte, {turn.frames} frame, "
-        f"{elapsed:.2f}s ({len(turn.data) / max(elapsed, 0.001) / 1024:.1f} KB/s), "
-        f"jeda terpanjang {turn.max_gap:.2f}s"
+    logger.info(
+        "[WS] %s: upload selesai %d byte, %d frame, %.2fs (%.1f KB/s), jeda terpanjang %.2fs",
+        device_id,
+        len(turn.data),
+        turn.frames,
+        elapsed,
+        len(turn.data) / max(elapsed, 0.001) / 1024,
+        turn.max_gap,
     )
 
     turn.state = "processing"
@@ -979,6 +1122,7 @@ async def handle_audio_stream(websocket: WebSocket, device_id: str):
         return
 
     session = None
+    evict_waiter = None
 
     try:
         authenticated = await authenticate(websocket)
@@ -992,15 +1136,16 @@ async def handle_audio_stream(websocket: WebSocket, device_id: str):
         old = _sessions.get(device_id)
 
         if old is not None:
-            print(f"[WS] {device_id}: koneksi lama diusir oleh koneksi baru")
+            logger.info("[WS] %s: koneksi lama diusir oleh koneksi baru", device_id)
             old.evict.set()
 
             try:
                 await asyncio.wait_for(old.done.wait(), timeout=EVICT_WAIT)
             except asyncio.TimeoutError:
-                print(f"[WS] {device_id}: koneksi lama belum selesai, lanjut")
+                logger.warning("[WS] %s: koneksi lama belum selesai, lanjut", device_id)
 
         _sessions[device_id] = session
+        evict_waiter = asyncio.ensure_future(session.evict.wait())
 
         await session.send_json({
             "type": "connected",
@@ -1013,11 +1158,11 @@ async def handle_audio_stream(websocket: WebSocket, device_id: str):
             "max_duration": AUDIO_MAX_DURATION,
         })
 
-        print(f"[WS] Device connected: {device_id} session={session.session_id}")
+        logger.info("[WS] Device connected: %s session=%s", device_id, session.session_id)
 
         while True:
             try:
-                message = await receive_message(websocket, session)
+                message = await receive_message(websocket, evict_waiter)
             except asyncio.TimeoutError:
                 # Saat memproses, perangkat memang diam: jangan dianggap idle.
                 turn = _turns.get(device_id)
@@ -1064,7 +1209,7 @@ async def handle_audio_stream(websocket: WebSocket, device_id: str):
                     break
 
     except Evicted:
-        print(f"[WS] Connection replaced: {device_id}")
+        logger.info("[WS] Connection replaced: %s", device_id)
 
         try:
             await websocket.close(code=1000)
@@ -1072,7 +1217,7 @@ async def handle_audio_stream(websocket: WebSocket, device_id: str):
             pass
 
     except asyncio.TimeoutError:
-        print(f"[WS] Receive idle timeout: {device_id}")
+        logger.info("[WS] Receive idle timeout: %s", device_id)
 
         try:
             await websocket.close(code=1001)
@@ -1080,10 +1225,10 @@ async def handle_audio_stream(websocket: WebSocket, device_id: str):
             pass
 
     except WebSocketDisconnect:
-        print(f"[WS] Device disconnected: {device_id}")
+        logger.info("[WS] Device disconnected: %s", device_id)
 
     except Exception:
-        print(f"[WS] Error for {device_id}:\n{traceback.format_exc()}")
+        logger.exception("[WS] Error for %s", device_id)
 
         try:
             await websocket.send_json({
@@ -1096,6 +1241,9 @@ async def handle_audio_stream(websocket: WebSocket, device_id: str):
             pass
 
     finally:
+        if evict_waiter is not None:
+            evict_waiter.cancel()
+
         if session is not None:
             session.dead = True
 
@@ -1106,4 +1254,4 @@ async def handle_audio_stream(websocket: WebSocket, device_id: str):
 
         app.state.ws_connection_slots.release()
 
-        print(f"[WS] Connection closed: {device_id}")
+        logger.info("[WS] Connection closed: %s", device_id)
