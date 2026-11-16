@@ -16,7 +16,7 @@ print("Model berhasil dimuat!")
 
 # Gunakan rekaman suara sendiri sebagai voice prompt.
 voice_state = model.get_state_for_audio_prompt(
-    "voices/voice_1.wav"
+    "voices/hivi_vintage.wav"
 )
 
 text = "Halo, saya Hivi. Senang bisa berbicara dengan Anda."

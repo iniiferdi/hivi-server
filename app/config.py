@@ -5,7 +5,7 @@ from pathlib import Path
 load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-VOICE_PATH = BASE_DIR / "voices" / "voice_1.wav"
+VOICE_PATH = BASE_DIR / "voices" / "hivi_vintage.wav"
 
 TTS_MODEL_CONFIG = (
     "hf://anak10thn/pocket-tts-indonesian/"
