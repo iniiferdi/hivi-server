@@ -16,7 +16,7 @@ TTS_NUM_THREADS = int(os.getenv("HIVI_TTS_THREADS", "0"))  # 0 = otomatis
 TTS_CACHE_MAX_ENTRIES = 64
 
 # STT (Faster-Whisper)
-STT_MODEL_SIZE = os.getenv("HIVI_STT_MODEL", "tiny")
+STT_MODEL_SIZE = os.getenv("HIVI_STT_MODEL", "small")
 STT_CPU_THREADS = int(os.getenv("HIVI_STT_THREADS", "4"))
 STT_LANGUAGE = "id"
 STT_BEAM_SIZE = 1
@@ -37,3 +37,9 @@ AUDIO_MAX_DURATION = 120
 
 # Pemrosesan audio
 AUDIO_MAX_CONCURRENT_PROCESSING = 1
+
+MUSIC_PCM_PATH = BASE_DIR / "assets" / "lofi" / "lofi.pcm"
+
+MUSIC_SAMPLE_RATE = 24000
+MUSIC_CHANNELS = 1
+MUSIC_BYTES_PER_SAMPLE = 2

@@ -15,6 +15,7 @@ Server -> client
 
 audio_start berisi "streaming": true bila audio disintesis bertahap; "size" bernilai 0
 karena panjang total belum diketahui, dan akhir audio ditandai pesan audio_end.
+audio_start juga berisi "kind": "speech" (suara balasan) atau "music" (musik).
 
 Pemrosesan (STT -> Brain -> TTS) berjalan di task terpisah per ucapan, sehingga
 handler tetap membaca pesan (cancel/ping) dan balasan dikirim ke koneksi AKTIF
@@ -43,6 +44,8 @@ from app.config import (
     AUDIO_MAX_SIZE,
     AUDIO_SAMPLE_RATE,
     HIVI_WS_TOKEN,
+    MUSIC_PCM_PATH,
+    MUSIC_SAMPLE_RATE,
     WS_AUTH_TIMEOUT,
     WS_IDLE_TIMEOUT,
     WS_MAX_CHUNK_BYTES,
@@ -88,6 +91,15 @@ TRANSIENT_ERROR_NAMES = frozenset({
 })
 
 AUDIO_OUTPUT_CHUNK_BYTES = 4096
+
+# Jenis audio balasan pada field "kind" di audio_start.
+KIND_SPEECH = "speech"
+KIND_MUSIC = "music"
+
+# Musik dikirim sedikit lebih cepat dari waktu nyata supaya speaker punya cadangan
+# saat WiFi tersendat. Nilai kecil saja: ring speaker terbatas dan klien memblokir
+# (back-pressure lewat TCP) bila ring penuh. 0 = tepat waktu nyata.
+MUSIC_LEAD_SECONDS = float(os.getenv("HIVI_MUSIC_LEAD", "0.3"))
 
 # Sintesis TTS bertahap: audio dikirim begitu chunk pertama siap.
 # Matikan (HIVI_TTS_STREAMING=0) bila firmware membutuhkan "size" total di audio_start.
@@ -187,6 +199,32 @@ def spawn(coroutine, name):
     task.add_done_callback(_log_background_failure)
 
     return task
+
+# ----------------------------------------------------------------
+# Music Intent
+# ----------------------------------------------------------------
+
+MUSIC_INTENT_PATTERN = re.compile(
+    r"\b(?:"
+    r"play\s+(?:the\s+)?music"
+    r"|putar(?:kan)?\s+(?:musik|lagu)"
+    r"|mainkan\s+(?:musik|lagu)"
+    r"|nyalakan\s+(?:musik|lagu)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def is_music_intent(transcript: str) -> bool:
+    """
+    Deteksi perintah pemutaran musik.
+    Tidak membutuhkan AI Brain.
+    """
+
+    if not transcript:
+        return False
+
+    return bool(MUSIC_INTENT_PATTERN.search(transcript))
 
 
 def prune_turns():
@@ -435,7 +473,7 @@ async def reply_error(turn, message, code):
         return False
 
 
-async def begin_audio(turn, sample_rate, size, streaming):
+async def begin_audio(turn, sample_rate, size, streaming, kind=KIND_SPEECH):
     """Tunggu koneksi aktif lalu kirim audio_start. None bila gagal."""
 
     session = await wait_session(turn.device_id, RESULT_WAIT)
@@ -454,6 +492,7 @@ async def begin_audio(turn, sample_rate, size, streaming):
             "size": size,
             "chunk_size": AUDIO_OUTPUT_CHUNK_BYTES,
             "streaming": streaming,
+            "kind": kind,
         })
     except asyncio.CancelledError:
         raise
@@ -505,6 +544,124 @@ async def reply_audio(turn, audio_output, sample_rate):
         logger.warning("[WS] %s: koneksi putus saat mengirim balasan", turn.device_id)
         return False
 
+# ----------------------------------------------------------------
+# Music Streamer
+# ----------------------------------------------------------------
+
+
+async def reply_music(turn):
+    """
+    Stream musik PCM dari server menuju ESP32 melalui WebSocket.
+
+    Format:
+        PCM S16LE
+        MUSIC_SAMPLE_RATE (harus sama dengan sample rate speaker, 24000 Hz)
+        Mono
+
+    Protokol:
+        audio_start (kind="music")
+        binary PCM chunks
+        audio_end
+        turn_complete
+
+    Dihentikan lewat pesan "cancel" dari perangkat (task ini dibatalkan).
+    """
+
+    path = MUSIC_PCM_PATH
+
+    # Validasi file
+    if not path.is_file():
+        logger.error("[MUSIC] File tidak ditemukan: %s", path)
+
+        await reply_error(
+            turn,
+            "File musik tidak ditemukan.",
+            "MUSIC_NOT_FOUND",
+        )
+
+        return False
+
+    if path.stat().st_size == 0 or path.stat().st_size % 2 != 0:
+        await reply_error(
+            turn,
+            "Format file musik tidak valid.",
+            "INVALID_MUSIC",
+        )
+
+        return False
+
+    # Mulai streaming
+    session = await begin_audio(
+        turn,
+        sample_rate=MUSIC_SAMPLE_RATE,
+        size=0,
+        streaming=True,
+        kind=KIND_MUSIC,
+    )
+
+    if session is None:
+        return False
+
+    bytes_per_second = MUSIC_SAMPLE_RATE * 2
+
+    sent_bytes = 0
+    started_at = time.monotonic()
+
+    try:
+        logger.info(
+            "[MUSIC] Starting playback: %s",
+            path.name,
+        )
+
+        with path.open("rb") as audio_file:
+
+            while True:
+
+                chunk = audio_file.read(AUDIO_OUTPUT_CHUNK_BYTES)
+
+                if not chunk:
+                    break
+
+                # Kirim PCM langsung ke ESP32
+                await session.send_bytes(chunk)
+
+                sent_bytes += len(chunk)
+
+                # Pacing berdasarkan durasi audio, dengan sedikit cadangan di depan
+                expected_time = sent_bytes / bytes_per_second
+                elapsed = time.monotonic() - started_at
+                delay = expected_time - elapsed - MUSIC_LEAD_SECONDS
+
+                if delay > 0:
+                    await asyncio.sleep(delay)
+
+        # Selesaikan streaming
+        await end_audio(session)
+
+        duration = sent_bytes / bytes_per_second
+
+        logger.info(
+            "[MUSIC] Playback completed: %.2f seconds, %d bytes",
+            duration,
+            sent_bytes,
+        )
+
+        return True
+
+    except asyncio.CancelledError:
+        logger.info(
+            "[MUSIC] Playback cancelled after %.2fs (%d bytes sent).",
+            sent_bytes / bytes_per_second,
+            sent_bytes,
+        )
+        raise
+
+    except Exception:
+        session.dead = True
+
+        logger.exception("[MUSIC] Streaming failed.")
+
+        return False
 
 async def reply_synthesized(app, turn, text):
     """Sintesis dan kirim audio bertahap. True bila terkirim penuh."""
@@ -660,6 +817,31 @@ async def process_turn(app, turn):
 
     logger.info("[STT] (%.2fs) Transcript: %r", time.monotonic() - stt_started, transcript)
     await notify(device_id, {"type": "transcript", "text": transcript})
+
+    # ---------------- MUSIC INTENT ----------------
+
+    if is_music_intent(transcript):
+
+        logger.info("[MUSIC] Music intent detected: %s", transcript)
+
+        await notify(device_id, {
+            "type": "response",
+            "text": "Baik, saya putarkan musik lo-fi."
+        })
+
+        await notify(device_id, {
+            "type": "processing",
+            "stage": "music"
+        })
+
+        sent = await reply_music(turn)
+
+        logger.info(
+            "[MUSIC] Playback result: %s",
+            sent
+        )
+
+        return
 
     # ---------------- Brain ----------------
     await notify(device_id, {"type": "processing", "stage": "brain"})
@@ -1091,7 +1273,15 @@ async def handle_cancel(session, device_id):
         turn.state = "failed"
         turn.data = bytearray()
 
-    await session.send_json({"type": "cancelled"})
+    try:
+        await session.send_json({"type": "cancelled"})
+    except Exception:
+        # Koneksi sudah ditutup (mis. perangkat memutus bersamaan dengan cancel).
+        # Bukan error server: akhiri handler dengan tenang.
+        session.dead = True
+        logger.info("[WS] %s: cancel diterima tetapi koneksi sudah tertutup", device_id)
+        return False
+
     return True
 
 
